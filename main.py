@@ -1,5 +1,7 @@
+import os
 import asyncio
 import random
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,7 +14,10 @@ from cards_db import (
 
 # ================= SOZLAMALAR =================
 BOT_TOKEN = "8944273231:AAGCZQhkoGIq4im_ncxTTkf5KgONIKl8src"
-MIN_PLAYERS = 5  # O'yin boshlanishi uchun minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
+MIN_PLAYERS = 2          # Minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
+LOBBY_TIMEOUT = 300      # O'yinga odam yig'ilmasa bekor qilish vaqti (300 s = 5 daqiqa)
+DISCUSSION_TIMEOUT = 120 # Karta ochish va muhokama vaqti (120 s = 2 daqiqa)
+VOTING_TIMEOUT = 60      # Ovoz berish vaqti (60 s = 1 daqiqa)
 # ==============================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -22,19 +27,99 @@ games = {}
 user_group = {}
 
 
-# ================= YORDAMCHI FUNKSIYALAR =================
+# ================= YORDAMCHI VA SINXRONIZATSIYA FUNKSIYALARI =================
+
+def cancel_phase_timer(game: dict):
+    """Joriy bosqich taymerini xavfsiz to'xtatish"""
+    task = game.get("phase_task")
+    if task and not task.done():
+        task.cancel()
+    game["phase_task"] = None
+
+
+async def is_host_or_admin(chat_id: int, user_id: int) -> bool:
+    """Foydalanuvchi o'yin egasi (Host) yoki guruh admini ekanligini tekshirish"""
+    if chat_id in games and games[chat_id]["host_id"] == user_id:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
 
 def format_dossier(player: dict, reveal_all: bool = False) -> str:
-    """O'yinchining barcha 12 ta kartasini chiroyli matn ko'rinishiga keltirish"""
+    """O'yinchining barcha 12 ta kartasini matn ko'rinishiga keltirish"""
     lines = [f"👤 <b>{player['name']}</b> dosyesi:\n━━━━━━━━━━━━━━━━━━"]
     for k, label in CARD_LABELS.items():
         card = player["cards"][k]
         if reveal_all or card["opened"]:
-            status = "✅" if card["opened"] else "🔓"
+            status = "✅ (Ochiq)" if card["opened"] else "🔓"
             lines.append(f"{status} <b>{label}:</b> {card['val']}")
         else:
             lines.append(f"🔒 <b>{label}:</b> <i>Yashirin</i>")
     return "\n".join(lines)
+
+
+def get_pm_cards_keyboard(player: dict) -> InlineKeyboardMarkup:
+    """LS (Shaxsiy chat) uchun kartalarni ochish tugmalari"""
+    buttons = []
+    for k, label in CARD_LABELS.items():
+        card = player["cards"][k]
+        if k == "maxsus":
+            if not card["used"]:
+                buttons.append([InlineKeyboardButton(
+                    text=f"⚡ ISHLATISH: {label}",
+                    callback_data="spec_menu"
+                )])
+        else:
+            if not card["opened"]:
+                clean_val = card['val'].replace("<b>", "").replace("</b>", "")
+                buttons.append([InlineKeyboardButton(
+                    text=f"🃏 Ochish: {label} ({clean_val[:22]}...)",
+                    callback_data=f"reveal:{k}"
+                )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def sync_player_pm(game: dict, player: dict, notice: str = None):
+    """Maxsus karta ishlatilganda yoki karta ochilganda o'yinchining LS xabarlarini yangilash"""
+    uid = player["id"]
+    dossier_text = format_dossier(player, reveal_all=True)
+
+    # 1. Boshida berilgan birinchi dosye xabarini yangilash
+    if player.get("init_msg_id"):
+        try:
+            await bot.edit_message_text(
+                chat_id=uid,
+                message_id=player["init_msg_id"],
+                text=f"📋 <b>SIZNING JORIY DOSYENGIZ (Yangilangan):</b>\n\n{dossier_text}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    # 2. Joriy aylanadagi faol tugmalar xabarini yangilash
+    if player.get("pm_msg_id") and game["phase"] == "DISCUSSION" and player["alive"]:
+        kb = get_pm_cards_keyboard(player)
+        status_line = "✅ <i>Siz bu aylanada karta ochib bo'ldingiz.</i>" if player["opened_in_round"] else "👇 <i>Ushbu aylanada ochish uchun karta tanlang:</i>"
+        try:
+            await bot.edit_message_text(
+                chat_id=uid,
+                message_id=player["pm_msg_id"],
+                text=f"🔄 <b>{game['round']}-Aylana</b> | {status_line}\n\n{dossier_text}",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    # 3. Agar unga nisbatan maxsus karta ishlatilgan bo'lsa, ogohlantirish yuborish
+    if notice:
+        try:
+            await bot.send_message(uid, f"🔔 <b>DIQQAT!</b>\n{notice}\n\nSizning dosye ma'lumotlaringiz yangilandi!", parse_mode="HTML")
+        except Exception:
+            pass
 
 
 def format_group_board(game: dict) -> str:
@@ -71,29 +156,7 @@ def format_group_board(game: dict) -> str:
     return text
 
 
-def get_pm_cards_keyboard(player: dict) -> InlineKeyboardMarkup:
-    """LS (Shaxsiy chat) uchun kartalarni ochish tugmalari"""
-    buttons = []
-    for k, label in CARD_LABELS.items():
-        card = player["cards"][k]
-        if k == "maxsus":
-            if not card["used"]:
-                buttons.append([InlineKeyboardButton(
-                    text=f"⚡ ISHLATISH: {label}",
-                    callback_data="spec_menu"
-                )])
-        else:
-            if not card["opened"]:
-                clean_val = card['val'].replace("<b>", "").replace("</b>", "")
-                buttons.append([InlineKeyboardButton(
-                    text=f"🃏 Ochish: {label} ({clean_val[:22]}...)",
-                    callback_data=f"reveal:{k}"
-                )])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
 def get_group_control_kb(bot_username: str) -> InlineKeyboardMarkup:
-    """Guruhda turadigan boshqaruv tugmalari"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🃏 Kartalarni ochish (Botga o'tish)", url=f"https://t.me/{bot_username}")],
         [
@@ -101,6 +164,117 @@ def get_group_control_kb(bot_username: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗳 Ovoz berishni boshlash", callback_data="start_vote")
         ]
     ])
+
+
+# ================= TAYMER FUNKSIYALARI (LOBBY, MUHOKAMA, OVOZ BERISH) =================
+
+async def auto_cancel_lobby(chat_id: int):
+    """5 daqiqa ichida o'yin boshlanmasa avtomatik bekor qilish"""
+    try:
+        await asyncio.sleep(LOBBY_TIMEOUT)
+        if chat_id in games and games[chat_id]["phase"] == "LOBBY":
+            game = games[chat_id]
+            for uid in game["players"]:
+                user_group.pop(uid, None)
+            msg_id = game.get("lobby_msg_id")
+            del games[chat_id]
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text="⏳ <b>Qabul vaqti tugadi!</b>\nBelgilangan 5 daqiqa ichida o'yin boshlanmagani sababli avtomatik bekor qilindi.\n\n🔄 Qayta boshlash: /bunker",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await bot.send_message(chat_id, "⏳ Vaqt tugagani uchun o'yin qabuli avtomatik yopildi.")
+    except asyncio.CancelledError:
+        pass
+
+
+async def discussion_timer_task(chat_id: int, round_num: int):
+    """Karta ochish va muhokama taymeri. Vaqt tugasa AFK o'yinchilar kartasini avto-ochib, ovoz berishga o'tkazadi"""
+    try:
+        half_time = DISCUSSION_TIMEOUT // 2
+        await asyncio.sleep(half_time)
+
+        if chat_id not in games or games[chat_id]["phase"] != "DISCUSSION" or games[chat_id]["round"] != round_num:
+            return
+
+        game = games[chat_id]
+        not_opened = [p["name"] for p in game["players"].values() if p["alive"] and not p["opened_in_round"]]
+        if not_opened:
+            await bot.send_message(
+                chat_id,
+                f"⏳ <b>Karta ochish va muhokama tugashiga {half_time} soniya qoldi!</b>\n"
+                f"❗️ Hali karta ochmaganlar: {', '.join(not_opened)}",
+                parse_mode="HTML"
+            )
+
+        await asyncio.sleep(DISCUSSION_TIMEOUT - half_time)
+
+        if chat_id not in games or games[chat_id]["phase"] != "DISCUSSION" or games[chat_id]["round"] != round_num:
+            return
+
+        # Vaqt tugadi! Karta ochmaganlarning kartasini majburan ochamiz
+        auto_revealed_msgs = []
+        for p in game["players"].values():
+            if p["alive"] and not p["opened_in_round"]:
+                if round_num == 1 and not p["cards"]["kasb"]["opened"]:
+                    chosen_key = "kasb"
+                else:
+                    closed_keys = [k for k, v in p["cards"].items() if not v["opened"] and k != "maxsus"]
+                    chosen_key = random.choice(closed_keys) if closed_keys else None
+
+                if chosen_key:
+                    p["cards"][chosen_key]["opened"] = True
+                    p["opened_in_round"] = True
+                    lbl = CARD_LABELS[chosen_key]
+                    val = p["cards"][chosen_key]["val"]
+                    auto_revealed_msgs.append(f"• <b>{p['name']}</b> [{lbl}]: {val}")
+                    await sync_player_pm(game, p)
+
+        if auto_revealed_msgs:
+            await bot.send_message(
+                chat_id,
+                f"⏰ <b>Muhokama vaqti tugadi!</b> Vaqtida karta ochmagan o'yinchilarning kartalari avtomatik ochildi:\n\n"
+                + "\n".join(auto_revealed_msgs),
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(chat_id, "⏰ <b>Muhokama vaqti tugadi!</b> Avtomatik ovoz berish bosqichiga o'tilmoqda...", parse_mode="HTML")
+
+        await trigger_voting_phase(chat_id)
+
+    except asyncio.CancelledError:
+        pass
+
+
+async def voting_timer_task(chat_id: int, round_num: int):
+    """Ovoz berish taymeri (60 soniya)"""
+    try:
+        await asyncio.sleep(VOTING_TIMEOUT - 20)
+        if chat_id not in games or games[chat_id]["phase"] != "VOTING" or games[chat_id]["round"] != round_num:
+            return
+
+        game = games[chat_id]
+        not_voted = [p["name"] for uid, p in game["players"].items() if p["alive"] and uid not in game["votes"]]
+        if not_voted:
+            await bot.send_message(
+                chat_id,
+                f"⏳ <b>Ovoz berish tugashiga 20 soniya qoldi!</b>\n❗️ Ovoz bermaganlar: {', '.join(not_voted)}",
+                parse_mode="HTML"
+            )
+
+        await asyncio.sleep(20)
+        if chat_id not in games or games[chat_id]["phase"] != "VOTING" or games[chat_id]["round"] != round_num:
+            return
+
+        await bot.send_message(chat_id, "⏰ <b>Ovoz berish vaqti tugadi!</b> Natijalar hisoblanmoqda...", parse_mode="HTML")
+        await finalize_voting(chat_id)
+
+    except asyncio.CancelledError:
+        pass
 
 
 # ================= 1. GURUHDA O'YIN YARATISH =================
@@ -115,6 +289,8 @@ async def cmd_bunker_group(message: types.Message):
         return await message.answer("⚠️ Guruhda allaqachon o'yin ketmoqda! To'xtatish uchun: /stopbunker")
 
     bot_info = await bot.get_me()
+    timeout_task = asyncio.create_task(auto_cancel_lobby(chat_id))
+
     games[chat_id] = {
         "chat_id": chat_id,
         "host_id": message.from_user.id,
@@ -126,7 +302,8 @@ async def cmd_bunker_group(message: types.Message):
         "used_professions": [],
         "players": {},
         "votes": {},
-        "lobby_msg_id": None
+        "lobby_msg_id": None,
+        "phase_task": timeout_task
     }
 
     join_url = f"https://t.me/{bot_info.username}?start=join_{chat_id}"
@@ -136,7 +313,9 @@ async def cmd_bunker_group(message: types.Message):
     ])
 
     sent = await message.answer(
-        f"☢️ <b>BUNKER O'YINIGA QABUL BOSHLANDI!</b>\n\n"
+        f"☢️ <b>BUNKER O'YINIGA QABUL BOSHLANDI!</b>\n"
+        f"👑 Boshlovchi: <b>{message.from_user.full_name}</b>\n"
+        f"⏳ Qabul vaqti: <b>5 daqiqa</b>\n\n"
         f"O'yinga qo'shilish uchun quyidagi tugmani bosing va botga <b>START</b> bering.\n\n"
         f"👥 <b>Qo'shilgan o'yinchilar (0/{MIN_PLAYERS}):</b>\n<i>Hozircha hech kim yo'q...</i>",
         reply_markup=kb,
@@ -147,15 +326,26 @@ async def cmd_bunker_group(message: types.Message):
 
 @dp.message(Command("stopbunker"))
 async def cmd_stop_bunker(message: types.Message):
+    if message.chat.type == "private":
+        return
+
     chat_id = message.chat.id
-    if chat_id in games:
-        for uid in games[chat_id]["players"]:
-            user_group.pop(uid, None)
-        del games[chat_id]
-        await message.answer("🛑 Bunker o'yini to'xtatildi.")
+    if chat_id not in games:
+        return await message.answer("⚠️ Guruhda hozir faol o'yin yo'q.")
+
+    if not await is_host_or_admin(chat_id, message.from_user.id):
+        return await message.reply("⛔ O'yinni faqat uni boshlagan odam yoki guruh adminlari to'xtata oladi!")
+
+    game = games[chat_id]
+    cancel_phase_timer(game)
+
+    for uid in game["players"]:
+        user_group.pop(uid, None)
+    del games[chat_id]
+    await message.answer(f"🛑 Bunker o'yini <b>{message.from_user.full_name}</b> tomonidan to'xtatildi.", parse_mode="HTML")
 
 
-# ================= 2. BOTGA START BOSIB QO'SHILISH (DEEP-LINK) =================
+# ================= 2. BOTGA START BOSIB QO'SHILISH =================
 
 @dp.message(CommandStart())
 async def cmd_start_private(message: types.Message, command: CommandObject):
@@ -183,10 +373,8 @@ async def cmd_start_private(message: types.Message, command: CommandObject):
     game = games[chat_id]
 
     if uid in game["players"]:
-        
         return await message.answer("✅ Siz allaqachon o'yinga qo'shilgansiz! Guruhda o'yin boshlanishini kuting.")
 
-    # YANGI QO'SHILADIGAN HIMOYA: Boshqa guruhda aktiv o'yini bormi?
     if uid in user_group and user_group[uid] in games and games[user_group[uid]]["phase"] != "ENDED":
         return await message.answer("⚠️ Siz hozir boshqa guruhdagi o'yinda ishtirok etyapsiz! Avval o'sha o'yinni yakunlang.")
 
@@ -197,17 +385,20 @@ async def cmd_start_private(message: types.Message, command: CommandObject):
         "opened_in_round": False,
         "shielded": False,
         "vote_weight": 1,
+        "init_msg_id": None,
+        "pm_msg_id": None,
         "cards": generate_character(game["used_professions"])
     }
     user_group[uid] = chat_id
 
     dossier_text = format_dossier(game["players"][uid], reveal_all=True)
-    await message.answer(
+    sent_init = await message.answer(
         f"✅ <b>Siz o'yinga muvaffaqiyatli qo'shildingiz!</b>\n\n"
         f"{dossier_text}\n\n"
         f"⏳ <i>Guruhda kamida {MIN_PLAYERS} ta o'yinchi yig'ilgach o'yin boshlanadi.</i>",
         parse_mode="HTML"
     )
+    game["players"][uid]["init_msg_id"] = sent_init.message_id
 
     bot_info = await bot.get_me()
     join_url = f"https://t.me/{bot_info.username}?start=join_{chat_id}"
@@ -243,13 +434,17 @@ async def cb_start_game(call: types.CallbackQuery):
     if chat_id not in games:
         return await call.answer("O'yin topilmadi!", show_alert=True)
 
+    if not await is_host_or_admin(chat_id, call.from_user.id):
+        return await call.answer("⛔ O'yinni faqat uni yaratgan boshlovchi yoki guruh admini boshlay oladi!", show_alert=True)
+
     game = games[chat_id]
     if game["phase"] != "LOBBY":
         return await call.answer("O'yin allaqachon boshlangan!", show_alert=True)
 
     if len(game["players"]) < MIN_PLAYERS:
-        return await call.answer(f"⚠️ O'yinni boshlash uchun kamida {MIN_PLAYERS} ta ishtirokchi kerak! Hozir: {len(game['players'])} ta.", show_alert=True)
+        return await call.answer(f"⚠️ Kamida {MIN_PLAYERS} ta ishtirokchi kerak! Hozir: {len(game['players'])} ta.", show_alert=True)
 
+    cancel_phase_timer(game)
     game["phase"] = "DISCUSSION"
     game["round"] = 1
     game["capacity"] = max(1, len(game["players"]) // 2)
@@ -258,21 +453,27 @@ async def cb_start_game(call: types.CallbackQuery):
     board_text = format_group_board(game)
 
     await call.message.edit_text(
-        board_text + "\n📢 <b>1-Aylana boshlandi!</b> Barcha o'yinchilar botning shaxsiy chatiga (LS) o'tib, o'z <b>1. Kasb</b> kartasini ochsin!",
+        board_text + f"\n📢 <b>1-Aylana boshlandi! (Vaqt: {DISCUSSION_TIMEOUT} soniya)</b>\nBarcha o'yinchilar botning shaxsiy chatiga (LS) o'tib, o'z <b>1. Kasb</b> kartasini ochsin!",
         reply_markup=get_group_control_kb(bot_info.username),
         parse_mode="HTML"
     )
 
     for uid, pdata in game["players"].items():
         try:
-            await bot.send_message(
+            sent_pm = await bot.send_message(
                 uid,
-                "🚨 <b>O'YIN BOSHLANDI! (1-Aylana)</b>\nQuyidagi tugmalardan birini bosib kartangizni guruhga oching (1-aylanada <b>1. Kasb</b> ochilishi shart):",
+                f"🚨 <b>O'YIN BOSHLANDI! (1-Aylana | ⏱ {DISCUSSION_TIMEOUT} s)</b>\n"
+                f"Quyidagi tugmalardan birini bosib kartangizni guruhga oching (1-aylanada <b>1. Kasb</b> ochilishi shart):\n\n"
+                f"{format_dossier(pdata, reveal_all=True)}",
                 reply_markup=get_pm_cards_keyboard(pdata),
                 parse_mode="HTML"
             )
+            pdata["pm_msg_id"] = sent_pm.message_id
         except Exception:
             pass
+
+    # 1-aylana taymerini yoqamiz
+    game["phase_task"] = asyncio.create_task(discussion_timer_task(chat_id, game["round"]))
 
 
 # ================= 4. BOT ICHIDA (LS) KARTANI OCHISH =================
@@ -292,15 +493,15 @@ async def cb_reveal_card(call: types.CallbackQuery):
         return await call.answer("💀 Siz bunkerdan quvilgansiz!", show_alert=True)
 
     if game["phase"] != "DISCUSSION":
-        return await call.answer("Hozir karta ochish bosqichi emas (Ovoz berish ketmoqda)!", show_alert=True)
+        return await call.answer("Hozir karta ochish bosqichi emas!", show_alert=True)
 
     if player["opened_in_round"]:
-        return await call.answer("⚠️ Siz bu aylanada allaqachon 1 ta karta ochdingiz! Keyingi aylanani kuting.", show_alert=True)
+        return await call.answer("⚠️ Siz bu aylanada allaqachon 1 ta karta ochdingiz!", show_alert=True)
 
     card_key = call.data.split(":")[1]
 
     if game["round"] == 1 and not player["cards"]["kasb"]["opened"] and card_key != "kasb":
-        return await call.answer("⚠️ 1-Aylanada qoidaga ko'ra birinchi bo'lib '1. Kasb' kartangizni ochishingiz shart!", show_alert=True)
+        return await call.answer("⚠️ 1-Aylanada birinchi bo'lib '1. Kasb' kartangizni ochishingiz shart!", show_alert=True)
 
     if player["cards"][card_key]["opened"]:
         return await call.answer("Bu karta allaqachon ochilgan!", show_alert=True)
@@ -311,23 +512,19 @@ async def cb_reveal_card(call: types.CallbackQuery):
     val_text = player["cards"][card_key]["val"]
 
     await call.answer(f"✅ {label_name} kartangiz guruhda e'lon qilindi!")
-
-    await call.message.edit_text(
-        f"✅ Siz bu aylanada <b>{label_name}</b> kartangizni ochdingiz: <b>{val_text}</b>\n\n"
-        f"{format_dossier(player, reveal_all=True)}",
-        reply_markup=get_pm_cards_keyboard(player),
-        parse_mode="HTML"
-    )
+    await sync_player_pm(game, player)
 
     opened_count = sum(1 for p in game["players"].values() if p["alive"] and p["opened_in_round"])
     alive_count = sum(1 for p in game["players"].values() if p["alive"])
     bot_info = await bot.get_me()
 
+    extra_note = "\n\n✅ <b>Barcha o'yinchilar karta ochib bo'ldi!</b> Boshlovchi ovoz berishni boshlashi yoki taymer tugashini kutishingiz mumkin." if opened_count >= alive_count else ""
+
     await bot.send_message(
         chat_id,
         f"🃏 <b>{player['name']}</b> o'zining <b>[{label_name}]</b> kartasini ochdi:\n"
         f"👉 <b>{val_text}</b>\n\n"
-        f"📊 <i>Bu aylanada karta ochganlar: {opened_count}/{alive_count}</i>",
+        f"📊 <i>Bu aylanada karta ochganlar: {opened_count}/{alive_count}</i>{extra_note}",
         reply_markup=get_group_control_kb(bot_info.username),
         parse_mode="HTML"
     )
@@ -369,11 +566,7 @@ async def cb_back_cards(call: types.CallbackQuery):
         return
     game = games[chat_id]
     player = game["players"][uid]
-    await call.message.edit_text(
-        format_dossier(player, reveal_all=True),
-        reply_markup=get_pm_cards_keyboard(player),
-        parse_mode="HTML"
-    )
+    await sync_player_pm(game, player)
 
 
 @dp.callback_query(F.data.startswith("use_spec:"))
@@ -397,10 +590,13 @@ async def cb_execute_special(call: types.CallbackQuery):
     code = spec["code"]
 
     effect_msg = ""
+    target_notice = ""
+
     if code == "heal":
         target["cards"]["salomatlik"]["val"] = "Mutlaqo sog'lom (Davolangan ✨)"
         target["cards"]["salomatlik"]["opened"] = True
         effect_msg = f"💉 <b>{player['name']}</b> maxsus kartasini ishlatib, <b>{target['name']}</b>ning salomatligini <b>'Mutlaqo sog'lom'</b> holatiga o'zgartirdi!"
+        target_notice = f"💉 <b>{player['name']}</b> sizning Salomatlik kartangizni 'Mutlaqo sog'lom' holatiga davoladi!"
 
     elif code == "spy":
         closed_keys = [k for k, v in target["cards"].items() if not v["opened"] and k != "maxsus"]
@@ -411,6 +607,7 @@ async def cb_execute_special(call: types.CallbackQuery):
                 f"🕵️‍♂️ <b>{player['name']}</b> maxsus kartasini ishlatib, <b>{target['name']}</b>ning yashirin "
                 f"<b>[{CARD_LABELS[rk]}]</b> kartasini barchaga fosh qildi:\n👉 <b>{target['cards'][rk]['val']}</b>"
             )
+            target_notice = f"🕵️‍♂️ <b>{player['name']}</b> sizning [{CARD_LABELS[rk]}] kartangizni guruhga fosh qildi!"
         else:
             effect_msg = f"🕵️‍♂️ <b>{player['name']}</b> maxsus karta ishlatdi, lekin <b>{target['name']}</b>ning barcha kartalari allaqachon ochiq edi!"
 
@@ -420,6 +617,7 @@ async def cb_execute_special(call: types.CallbackQuery):
         target["cards"]["kasb"]["tag"] = new_tag
         target["cards"]["kasb"]["opened"] = True
         effect_msg = f"🔄 <b>{player['name']}</b> maxsus kartasini ishlatib, <b>{target['name']}</b>ning kasbini <b>'{new_job}'</b>ga o'zgartirib yubordi!"
+        target_notice = f"🔄 <b>{player['name']}</b> sizning Kasbingizni '{new_job}'ga o'zgartirib yubordi!"
 
     elif code == "cure_phobia":
         target["cards"]["fobiya"]["val"] = "Fobiya yo'q (Bartaraf etildi ✨)"
@@ -427,6 +625,7 @@ async def cb_execute_special(call: types.CallbackQuery):
         target["cards"]["zaiflik"]["val"] = "Zaiflik yo'q (Bartaraf etildi ✨)"
         target["cards"]["zaiflik"]["opened"] = True
         effect_msg = f"🧠 <b>{player['name']}</b> maxsus kartasini ishlatib, <b>{target['name']}</b>ni fobiya va zaiflikdan butunlay xalos qildi!"
+        target_notice = f"🧠 <b>{player['name']}</b> sizning Fobiya va Zaifligingizni butunlay yo'q qildi!"
 
     elif code == "steal_bag":
         stolen_item = target["cards"]["jihoz"]["val"]
@@ -435,6 +634,7 @@ async def cb_execute_special(call: types.CallbackQuery):
         target["cards"]["jihoz"]["val"] = "Bo'sh (O'g'irlangan 😭)"
         target["cards"]["jihoz"]["opened"] = True
         effect_msg = f"🎒 <b>{player['name']}</b> maxsus karta orqali <b>{target['name']}</b>ning jihozini (<i>{stolen_item}</i>) tortib oldi!"
+        target_notice = f"🎒 <b>{player['name']}</b> sizning 9-Jihozingizni o'g'irlab oldi!"
 
     elif code == "swap_health":
         my_h = player["cards"]["salomatlik"]["val"]
@@ -444,14 +644,17 @@ async def cb_execute_special(call: types.CallbackQuery):
         player["cards"]["salomatlik"]["opened"] = True
         target["cards"]["salomatlik"]["opened"] = True
         effect_msg = f"🔀 <b>{player['name']}</b> o'z salomatligini (<i>{my_h}</i>) <b>{target['name']}</b>ning salomatligi (<i>{tg_h}</i>) bilan almashtirdi!"
+        target_notice = f"🔀 <b>{player['name']}</b> o'zining Salomatligini ({my_h}) sizniki bilan almashtirdi!"
 
     elif code == "shield":
         target["shielded"] = True
         effect_msg = f"🛡 <b>{player['name']}</b> maxsus karta orqali <b>{target['name']}</b>ga <b>Immunitet</b> berdi! Bu aylanada unga qarshi ovoz berib bo'lmaydi."
+        target_notice = f"🛡 <b>{player['name']}</b> sizga ushbu aylana uchun Ovoz berish Immunitetini berdi!"
 
     elif code == "double_vote":
         target["vote_weight"] = 2
         effect_msg = f"⚖️ <b>{player['name']}</b> maxsus karta ishlatdi: navbatdagi ovoz berishda <b>{target['name']}</b>ning ovozi <b>2 ta ovoz</b>ga teng bo'ladi!"
+        target_notice = f"⚖️ <b>{player['name']}</b> sizning ovoz kuchingizni 2 barobarga oshirdi!"
 
     elif code == "rejuvenate":
         gender = target["cards"]["bio"].get("gender", "Inson")
@@ -459,12 +662,16 @@ async def cb_execute_special(call: types.CallbackQuery):
         target["cards"]["bio"]["fertile"] = True
         target["cards"]["bio"]["opened"] = True
         effect_msg = f"🧬 <b>{player['name']}</b> maxsus karta bilan <b>{target['name']}</b>ning biologiyasini 24 yoshli sog'lom va nasl qoldira oladigan holatga yangiladi!"
+        target_notice = f"🧬 <b>{player['name']}</b> sizning Biologiyangizni '24 yosh, sog'lom' holatiga yangiladi!"
 
-    await call.message.edit_text(
-        f"⚡ Maxsus kartangiz ishlatildi!\n\n{format_dossier(player, reveal_all=True)}",
-        reply_markup=get_pm_cards_keyboard(player),
-        parse_mode="HTML"
-    )
+    # Kartani ishlatgan o'yinchining o'z LS xabarlarini yangilash
+    await sync_player_pm(game, player)
+
+    # Agar boshqa o'yinchiga ishlatilgan bo'lsa, uning ham LS dosyesi va tugmalarini darhol yangilash!
+    if target_id != uid:
+        await sync_player_pm(game, target, notice=target_notice)
+
+    await call.answer("⚡ Maxsus karta muvaffaqiyatli ishlatildi!")
 
     await bot.send_message(
         chat_id,
@@ -496,16 +703,31 @@ async def cb_start_voting(call: types.CallbackQuery):
     if chat_id not in games:
         return await call.answer("O'yin topilmadi!", show_alert=True)
 
+    if not await is_host_or_admin(chat_id, call.from_user.id):
+        return await call.answer("⛔ Ovoz berishni faqat boshlovchi yoki guruh admini boshlay oladi!", show_alert=True)
+
     game = games[chat_id]
     if game["phase"] != "DISCUSSION":
         return await call.answer("Hozir ovoz berishni boshlab bo'lmaydi!", show_alert=True)
+
+    await call.answer()
+    await trigger_voting_phase(chat_id)
+
+
+async def trigger_voting_phase(chat_id: int):
+    """Ovoz berish bosqichini boshlash va 60 soniyalik taymer yoqish"""
+    if chat_id not in games:
+        return
+    game = games[chat_id]
+    cancel_phase_timer(game)
 
     game["phase"] = "VOTING"
     game["votes"] = {}
 
     bot_info = await bot.get_me()
-    await call.message.answer(
-        f"🗳 <b>{game['round']}-AYLANA OVOZ BERISH BOSHLANDI!</b>\n\n"
+    await bot.send_message(
+        chat_id,
+        f"🗳 <b>{game['round']}-AYLANA OVOZ BERISH BOSHLANDI! (⏱ Vaqt: {VOTING_TIMEOUT} soniya)</b>\n\n"
         f"Barcha tirik o'yinchilar botning shaxsiy chatiga (LS) o'tib, bunkerga noloyiq deb bilgan 1 ta o'yinchiga ovoz bersin!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗳 Ovoz berish (Botga o'tish)", url=f"https://t.me/{bot_info.username}")],
@@ -530,13 +752,14 @@ async def cb_start_voting(call: types.CallbackQuery):
         try:
             await bot.send_message(
                 uid,
-                f"🗳 <b>{game['round']}-Aylana: Ovoz berish vaqti!</b>\nKimni bunkerdan chetlatish kerak deb hisoblaysiz?",
+                f"🗳 <b>{game['round']}-Aylana: Ovoz berish vaqti! (⏱ {VOTING_TIMEOUT} s)</b>\nKimni bunkerdan chetlatish kerak deb hisoblaysiz?",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=vote_buttons),
                 parse_mode="HTML"
             )
         except Exception:
             pass
-    await call.answer()
+
+    game["phase_task"] = asyncio.create_task(voting_timer_task(chat_id, game["round"]))
 
 
 @dp.callback_query(F.data.startswith("vote:"))
@@ -581,16 +804,24 @@ async def cb_cast_vote(call: types.CallbackQuery):
 @dp.callback_query(F.data == "force_end_vote")
 async def cb_force_end_vote(call: types.CallbackQuery):
     chat_id = call.message.chat.id
+    if not await is_host_or_admin(chat_id, call.from_user.id):
+        return await call.answer("⛔ Faqat boshlovchi yoki guruh admini ovozlarni yakunlay oladi!", show_alert=True)
+
     if chat_id in games and games[chat_id]["phase"] == "VOTING":
         await finalize_voting(chat_id)
     await call.answer()
 
 
 async def finalize_voting(chat_id: int):
+    if chat_id not in games:
+        return
     game = games[chat_id]
+    cancel_phase_timer(game)
+
     if not game["votes"]:
         game["phase"] = "DISCUSSION"
         await bot.send_message(chat_id, "⚠️ Hech kim ovoz bermadi! Muhokama davom etadi.")
+        game["phase_task"] = asyncio.create_task(discussion_timer_task(chat_id, game["round"]))
         return
 
     tally = {}
@@ -608,8 +839,7 @@ async def finalize_voting(chat_id: int):
     kicked_id = random.choice(candidates)
     kicked_player = game["players"][kicked_id]
     kicked_player["alive"] = False
-    user_group.pop(kicked_id, None)  # Quvilgan o'yinchini bo'shatish (boshqa guruhda o'ynay olishi uchun)
-    
+    user_group.pop(kicked_id, None)
 
     full_dossier = format_dossier(kicked_player, reveal_all=True)
     details_str = "\n".join(vote_details)
@@ -638,7 +868,7 @@ async def finalize_voting(chat_id: int):
             f"🔄 Yangi o'yin boshlash uchun /bunker buyrug'ini yozing!",
             parse_mode="HTML"
         )
-        for uid in game["players"]:
+        for uid in list(game["players"].keys()):
             user_group.pop(uid, None)
         del games[chat_id]
     else:
@@ -649,7 +879,6 @@ async def finalize_voting(chat_id: int):
             p["shielded"] = False
             p["vote_weight"] = 1
 
-        # 50% ehtimol bilan tasodifiy bunker hodisasi yuz beradi
         event_text = ""
         if random.random() < 0.5:
             event_text = "\n\n" + random.choice(RANDOM_EVENTS)
@@ -657,7 +886,7 @@ async def finalize_voting(chat_id: int):
         bot_info = await bot.get_me()
         await bot.send_message(
             chat_id,
-            f"🔄 <b>{game['round']}-AYLANA BOSHLANDI!</b>\n"
+            f"🔄 <b>{game['round']}-AYLANA BOSHLANDI! (⏱ Vaqt: {DISCUSSION_TIMEOUT} soniya)</b>\n"
             f"Tirik qolgan o'yinchilar botning shaxsiy chatiga (LS) kirib, navbatdagi 1 tadan kartasini ochsin!"
             f"{event_text}",
             reply_markup=get_group_control_kb(bot_info.username),
@@ -666,20 +895,24 @@ async def finalize_voting(chat_id: int):
 
         for pdata in alive_players:
             try:
-                await bot.send_message(
+                sent_pm = await bot.send_message(
                     pdata["id"],
-                    f"🔄 <b>{game['round']}-Aylana boshlandi!</b> Navbatdagi kartangizni oching:",
+                    f"🔄 <b>{game['round']}-Aylana boshlandi! (⏱ {DISCUSSION_TIMEOUT} s)</b>\n"
+                    f"Navbatdagi kartangizni oching:\n\n"
+                    f"{format_dossier(pdata, reveal_all=True)}",
                     reply_markup=get_pm_cards_keyboard(pdata),
                     parse_mode="HTML"
                 )
+                pdata["pm_msg_id"] = sent_pm.message_id
             except Exception:
                 pass
 
+        # Yangi aylana taymerini yoqamiz
+        game["phase_task"] = asyncio.create_task(discussion_timer_task(chat_id, game["round"]))
 
-import os
-from aiohttp import web
 
-# Render "uxlab qolmasligi" uchun mitti veb-server
+# ================= RENDER UCHUN WEB-SERVER VA ISHGA TUSHIRISH =================
+
 async def health_check(request):
     return web.Response(text="Bunker Bot 24/7 ishlamoqda!")
 
@@ -694,8 +927,7 @@ async def start_dummy_server():
     print(f"🌐 Dummy server {port}-portda ishga tushdi")
 
 async def main():
-    print("🤖 Bunker PRO Guruh Boti ishga tushdi!")
-    # Ham mitti veb-serverni, ham Telegram botni parallel yoqamiz
+    print("🤖 Bunker PRO Guruh Boti (Taymerlar bilan) ishga tushdi!")
     await start_dummy_server()
     await dp.start_polling(bot)
 
