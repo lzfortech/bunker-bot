@@ -12,7 +12,7 @@ from cards_db import (
 
 # ================= SOZLAMALAR =================
 BOT_TOKEN = "8944273231:AAGCZQhkoGIq4im_ncxTTkf5KgONIKl8src"
-MIN_PLAYERS = 2  # O'yin boshlanishi uchun minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
+MIN_PLAYERS = 5  # O'yin boshlanishi uchun minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
 # ==============================================
 
 bot = Bot(token=BOT_TOKEN)
