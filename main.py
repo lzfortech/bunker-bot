@@ -707,7 +707,8 @@ async def cb_start_voting(call: types.CallbackQuery):
         return await call.answer("⛔ Ovoz berishni faqat boshlovchi yoki guruh admini boshlay oladi!", show_alert=True)
 
     game = games[chat_id]
-    if game["phase"] != "DISCUSSION":
+    #if game["phase"] != "DISCUSSION":
+    if game["phase"] in ("LOBBY", "ENDED"):
         return await call.answer("Hozir ovoz berishni boshlab bo'lmaydi!", show_alert=True)
 
     await call.answer()
