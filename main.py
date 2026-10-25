@@ -183,7 +183,12 @@ async def cmd_start_private(message: types.Message, command: CommandObject):
     game = games[chat_id]
 
     if uid in game["players"]:
+        
         return await message.answer("✅ Siz allaqachon o'yinga qo'shilgansiz! Guruhda o'yin boshlanishini kuting.")
+
+    # YANGI QO'SHILADIGAN HIMOYA: Boshqa guruhda aktiv o'yini bormi?
+    if uid in user_group and user_group[uid] in games and games[user_group[uid]]["phase"] != "ENDED":
+        return await message.answer("⚠️ Siz hozir boshqa guruhdagi o'yinda ishtirok etyapsiz! Avval o'sha o'yinni yakunlang.")
 
     game["players"][uid] = {
         "id": uid,
@@ -603,6 +608,8 @@ async def finalize_voting(chat_id: int):
     kicked_id = random.choice(candidates)
     kicked_player = game["players"][kicked_id]
     kicked_player["alive"] = False
+    user_group.pop(kicked_id, None)  # Quvilgan o'yinchini bo'shatish (boshqa guruhda o'ynay olishi uchun)
+    
 
     full_dossier = format_dossier(kicked_player, reveal_all=True)
     details_str = "\n".join(vote_details)
