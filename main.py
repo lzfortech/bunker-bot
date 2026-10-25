@@ -856,7 +856,8 @@ async def finalize_voting(chat_id: int):
     alive_players = [p for p in game["players"].values() if p["alive"]]
     if len(alive_players) <= game["capacity"]:
         game["phase"] = "ENDED"
-        winners_text = "\n\n".join([format_dossier(p, reveal_all=True) for p in alive_players])
+       # winners_text = "\n\n".join([format_dossier(p, reveal_all=True) for p in alive_players])
+        winners_text = "\n".join([f"👤 <b>{p['name']}</b>" for p in alive_players])
         epilogue_text = generate_epilogue(game, alive_players)
 
         await bot.send_message(
