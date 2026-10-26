@@ -16,7 +16,7 @@ from cards_db import (
 # ================= SOZLAMALAR =================
 # Tokenni kod ichida emas, serverning yashirin xotirasidan (Environment) olamiz:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "BU_YERGA_TOKEN_YOZMAYSIZ")
-MIN_PLAYERS = 5
+MIN_PLAYERS = 2
 
 #MIN_PLAYERS = 2          # Minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
 LOBBY_TIMEOUT = 300      # O'yinga odam yig'ilmasa bekor qilish vaqti (300 s = 5 daqiqa)
