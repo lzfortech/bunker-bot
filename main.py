@@ -13,8 +13,12 @@ from cards_db import (
 )
 
 # ================= SOZLAMALAR =================
-BOT_TOKEN = "8944273231:AAGCZQhkoGIq4im_ncxTTkf5KgONIKl8src"
-MIN_PLAYERS = 2          # Minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
+# ================= SOZLAMALAR =================
+# Tokenni kod ichida emas, serverning yashirin xotirasidan (Environment) olamiz:
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "BU_YERGA_TOKEN_YOZMAYSIZ")
+MIN_PLAYERS = 5
+
+#MIN_PLAYERS = 2          # Minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
 LOBBY_TIMEOUT = 300      # O'yinga odam yig'ilmasa bekor qilish vaqti (300 s = 5 daqiqa)
 DISCUSSION_TIMEOUT = 120 # Karta ochish va muhokama vaqti (120 s = 2 daqiqa)
 VOTING_TIMEOUT = 60      # Ovoz berish vaqti (60 s = 1 daqiqa)
