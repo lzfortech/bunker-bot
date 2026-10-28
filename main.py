@@ -20,8 +20,8 @@ MIN_PLAYERS = 2
 
 #MIN_PLAYERS = 2          # Minimal o'yinchilar soni (test uchun 2 qilishingiz mumkin)
 LOBBY_TIMEOUT = 300      # O'yinga odam yig'ilmasa bekor qilish vaqti (300 s = 5 daqiqa)
-DISCUSSION_TIMEOUT = 120 # Karta ochish va muhokama vaqti (120 s = 2 daqiqa)
-VOTING_TIMEOUT = 60      # Ovoz berish vaqti (60 s = 1 daqiqa)
+DISCUSSION_TIMEOUT = 300 # Karta ochish va muhokama vaqti (120 s = 2 daqiqa)
+VOTING_TIMEOUT = 300      # Ovoz berish vaqti (60 s = 1 daqiqa)
 # ==============================================
 
 bot = Bot(token=BOT_TOKEN)
