@@ -824,28 +824,36 @@ async def finalize_voting(chat_id: int):
     game = games[chat_id]
     cancel_phase_timer(game)
 
-    if not game["votes"]:
-        game["phase"] = "DISCUSSION"
-        await bot.send_message(chat_id, "⚠️ Hech kim ovoz bermadi! Muhokama davom etadi.")
-        game["phase_task"] = asyncio.create_task(discussion_timer_task(chat_id, game["round"]))
-        return
-
     tally = {}
     vote_details = []
-    for voter_id, target_id in game["votes"].items():
-        weight = game["players"][voter_id].get("vote_weight", 1)
-        tally[target_id] = tally.get(target_id, 0) + weight
-        voter_name = game["players"][voter_id]["name"]
-        target_name = game["players"][target_id]["name"]
-        w_str = f" (x{weight} ovoz)" if weight > 1 else ""
-        vote_details.append(f"• {voter_name}{w_str} ➡️ {target_name}")
 
-    max_votes = max(tally.values())
-    candidates = [tid for tid, count in tally.items() if count == max_votes]
-    kicked_id = random.choice(candidates)
+    if game["votes"]:
+        # Kimdir ovoz bergan bo'lsa, faqat berilgan ovozlarni hisoblaymiz
+        for voter_id, target_id in game["votes"].items():
+            weight = game["players"][voter_id].get("vote_weight", 1)
+            tally[target_id] = tally.get(target_id, 0) + weight
+            voter_name = game["players"][voter_id]["name"]
+            target_name = game["players"][target_id]["name"]
+            w_str = f" (x{weight} ovoz)" if weight > 1 else ""
+            vote_details.append(f"• {voter_name}{w_str} ➡️ {target_name}")
+
+        max_votes = max(tally.values())
+        candidates = [tid for tid, count in tally.items() if count == max_votes]
+        kicked_id = random.choice(candidates)
+        details_str = "\n".join(vote_details)
+    else:
+        # Agar UMUMAN HECH KIM ovoz bermagan bo'lsa, o'yin qotib qolmasligi uchun tasodifiy 1 kishi ketadi
+        possible = [uid for uid, p in game["players"].items() if p["alive"] and not p.get("shielded")]
+        if not possible:
+            possible = [uid for uid, p in game["players"].items() if p["alive"]]
+        kicked_id = random.choice(possible)
+        max_votes = 0
+        details_str = "⚠️ <i>Vaqt ichida hech kim ovoz bermadi! Bunker qoidasiga ko'ra tasodifiy ishtirokchi chetlatildi.</i>"
+
     kicked_player = game["players"][kicked_id]
     kicked_player["alive"] = False
     user_group.pop(kicked_id, None)
+
 
     full_dossier = format_dossier(kicked_player, reveal_all=True)
     details_str = "\n".join(vote_details)
