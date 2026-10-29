@@ -34,11 +34,12 @@ user_group = {}
 # ================= YORDAMCHI VA SINXRONIZATSIYA FUNKSIYALARI =================
 
 def cancel_phase_timer(game: dict):
-    """Joriy bosqich taymerini xavfsiz to'xtatish"""
+    """Joriy bosqich taymerini xavfsiz to'xtatish (o'zini-o'zi o'chirmaslik sharti bilan)"""
     task = game.get("phase_task")
-    if task and not task.done():
+    if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
     game["phase_task"] = None
+
 
 
 async def is_host_or_admin(chat_id: int, user_id: int) -> bool:
